@@ -1,13 +1,13 @@
-et = Ember.set;
+var get = Ember.get, set = Ember.set;
 
-var DjangoTastypieSerializer = DS.RESTSerializer.extend({
+DS.DjangoTastypieSerializer = DS.RESTSerializer.extend({
 
   keyForAttribute: function(attr) {
     return Ember.String.decamelize(attr);
   },
 
-  keyForRelationship: function(key, type) {
-    return Ember.String.decamelize(key);
+  keyForRelationship: function(attr) {
+    return Ember.String.decamelize(attr);
   },
 
   /**
@@ -18,37 +18,6 @@ var DjangoTastypieSerializer = DS.RESTSerializer.extend({
 
     var specificExtract = "extract" + requestType.charAt(0).toUpperCase() + requestType.substr(1);
     return this[specificExtract](store, type, payload, id, requestType);
-  },
-  
-  /**
-    `extractMeta` is used to deserialize any meta information in the
-    adapter payload. By default Ember Data expects meta information to
-    be located on the `meta` property of the payload object.
-  
-    The actual nextUrl is being stored. The offset must be extracted from
-    the string to do a new call.
-    When there are remaining objects to be returned, Tastypie returns a
-    `next` URL that in the meta header. Whenever there are no
-    more objects to be returned, the `next` paramater value will be null.
-    Instead of calculating the next `offset` each time, we store the nextUrl
-    from which the offset will be extrated for the next request
-    
-    @method extractMeta
-    @param {DS.Store} store
-    @param {subclass of DS.Model} type
-    @param {Object} payload
-  */
-  extractMeta: function(store, type, payload) {
-    if (payload && payload.meta) {
-      var adapter = store.adapterFor(type);
-              
-      if (adapter && adapter.get('since') !== null && payload.meta[adapter.get('since')] !== undefined) {
-        payload.meta.since = payload.meta[adapter.get('since')];
-      }
-      
-      store.setMetadataFor(type, payload.meta);
-      delete payload.meta;
-    }
   },
 
   extractMany: function(loader, json, type, records) {
@@ -96,19 +65,11 @@ var DjangoTastypieSerializer = DS.RESTSerializer.extend({
         }
       }
       if (hash[key]) {
-        var isEmbedded = self.isEmbedded(relationship);
         if (relationship.kind === 'belongsTo'){
-          var resourceUri = hash[key];
-          if (!isEmbedded) {
-            Ember.assert(relationship.key + " is an async relation but the related data in the response is not a URI", typeof resourceUri == "string");
-          }
-          hash[key] = self.resourceUriToId(hash[key]);
+          hash[key] = this.resourceUriToId(hash[key]);
         } else if (relationship.kind === 'hasMany'){
           var ids = [];
           hash[key].forEach(function (resourceUri){
-            if (!isEmbedded) {
-              Ember.assert(relationship.key + " is an async relation but the related data in the response is not a URI", typeof resourceUri == "string");
-            }
             ids.push(self.resourceUriToId(resourceUri));
           });
           hash[key] = ids;
@@ -135,34 +96,20 @@ var DjangoTastypieSerializer = DS.RESTSerializer.extend({
     return this._super(store, primaryType, newPayload, recordId, requestType);
   },
 
-  isEmbedded: function(relationship) {
-    var key = relationship.key;
-    var attrs = get(this, 'attrs');
-    var config = attrs && attrs[key] ? attrs[key] : false;
-    if (config) {
-        // Per model serializer will take preference for the embedded mode
-        return (config.embedded === 'load' || config.embedded === 'always');
-    }
-
-    // Consider the resource as embedded if the relationship is not async
-    return !(relationship.options.async ? relationship.options.async : false);
-  },
-  
-  isResourceUri: function(adapter, payload) {
-    if (typeof payload !== 'string') {
-      return false;
-    }
-    return true;
+  isEmbedded: function(config) {
+    return !!config && (config.embedded === 'load' || config.embedded === 'always');
   },
 
   extractEmbeddedFromPayload: function(store, type, payload) {
     var self = this;
+    var attrs = get(this, 'attrs');
+
+    if (!attrs) { return; }
 
     type.eachRelationship(function(key, relationship) {
-      var attrs = get(self, 'attrs');
-      var config = attrs && attrs[key] ? attrs[key] : false;
+      var config = attrs[key];
 
-      if (self.isEmbedded(relationship)) {
+      if (self.isEmbedded(config)) {
         if (relationship.kind === 'hasMany') {
           self.extractEmbeddedFromHasMany(store, key, relationship, payload, config);
         } else if (relationship.kind === 'belongsTo') {
@@ -210,12 +157,6 @@ var DjangoTastypieSerializer = DS.RESTSerializer.extend({
     }
 
     var data = payload[key];
-    
-    // Don't try to process data if it's not data!
-    if (serializer.isResourceUri(store.adapterFor(relationship.type.typeKey), data)) {
-      return;
-    }
-    
     var embeddedType = store.modelFor(relationship.type.typeKey);
 
     serializer.extractEmbeddedFromPayload(store, embeddedType, data);
@@ -249,48 +190,24 @@ var DjangoTastypieSerializer = DS.RESTSerializer.extend({
   },
 
   serializeHasMany: function(record, json, relationship) {
-    var key = relationship.key;
-    key = this.keyForRelationship ? this.keyForRelationship(key, "hasMany") : key;
+    var key = relationship.key,
+    attrs = get(this, 'attrs'),
+    config = attrs && attrs[key] ? attrs[key] : false;
+    key = this.keyForRelationship ? this.keyForRelationship(key, "belongsTo") : key;
 
-    var relationshipType = record.constructor.determineRelationshipType(relationship);
+    var relationshipType = DS.RelationshipChange.determineRelationshipType(record.constructor, relationship);
 
     if (relationshipType === 'manyToNone' || relationshipType === 'manyToMany' || relationshipType === 'manyToOne') {
-      if (this.isEmbedded(relationship)) {
+      if (this.isEmbedded(config)) {
         json[key] = get(record, key).map(function (relation) {
           var data = relation.serialize();
-
-          // Embedded objects need the ID for update operations
-          var id = relation.get('id');
-          if (!!id) { data.id = id; }
-
           return data;
         });
       } else {
-        var relationData = get(record, relationship.key); 
-        
-        // We can't deal with promises here. We need actual data
-        if (relationData instanceof DS.PromiseArray) {
-          // We need the content of the promise. Make sure it is fulfilled
-          if (relationData.get('isFulfilled')) {
-            // Use the fulfilled array
-            relationData = relationData.get('content');
-          } else {
-            // If the property hasn't been fulfilled then it hasn't changed.
-            // Fall back to the internal data. It contains enough for relationshipToResourceUri.
-            relationData = get(record, key).mapBy('id').map(function(_id) {
-              return {id: _id};
-            }) || [];
-          }
-        }
-        
-        json[key] = relationData.map(function (next){
+        json[key] = get(record, relationship.key).map(function (next){
           return this.relationshipToResourceUri(relationship, next);
         }, this);
-        
       }
     }
   }
 });
-
-export default DjangoTastypieSerializer;
-
